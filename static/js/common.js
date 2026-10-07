@@ -3,7 +3,7 @@
    ============================================================ */
 
 const PAGES = [
-  { file: "corpus.html",    name: "语料库管理",   desc: "上传与清洗" },
+  { file: "corpus.html",    name: "语料库管理",   desc: "批量入库 · 标签 · 筛选导出" },
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },

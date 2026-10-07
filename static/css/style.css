@@ -288,6 +288,42 @@ table.data tr:hover td { background: var(--surface-2); }
 /* 语料预览 */
 .preview { font-size: 13px; color: var(--text-muted); white-space: pre-wrap; max-height: 160px; overflow: auto; }
 
+/* 标签 chip（筛选器可点选） */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 13px; border-radius: 999px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text-muted);
+  user-select: none; transition: all .15s;
+}
+.chip:hover { border-color: var(--primary); color: var(--primary); }
+.chip.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+.chip .cnt { font-size: 11px; opacity: .75; font-family: var(--mono); }
+
+/* 文档标签徽章 */
+.tag-badge {
+  display: inline-block; padding: 1px 9px; margin: 1px 4px 1px 0;
+  border-radius: 999px; font-size: 12px;
+  background: var(--primary-soft); color: var(--primary); border: 1px solid #c7d2fe;
+}
+
+/* 标签内联编辑 */
+.tag-edit { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.tag-edit input { width: 240px; padding: 5px 10px; font-size: 13px; }
+
+/* 筛选表单网格 */
+.filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+
+/* 分页条 */
+.pagination { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
+.pagination button {
+  min-width: 34px; padding: 6px 10px; border: 1px solid var(--border);
+  background: #fff; border-radius: 7px; cursor: pointer; font-size: 13px; color: var(--text);
+}
+.pagination button:hover:not(:disabled):not(.cur) { border-color: var(--primary); color: var(--primary); }
+.pagination button.cur { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.pagination button:disabled { opacity: .45; cursor: not-allowed; }
+
 /* 句法树 */
 .tree-wrap { overflow: auto; }
 .tree-node { display: inline-block; text-align: center; }

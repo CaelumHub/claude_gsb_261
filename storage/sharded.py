@@ -67,6 +67,47 @@ def _read_json(path: str, default: Any) -> Any:
         return json.load(fh)
 
 
+def _seq_of(record: dict) -> int:
+    """记录的全局单调序号，用于排序时的确定性 tie-break。
+
+    优先取插入时写入的 ``_seq`` 字段；历史数据没有该字段时，
+    从 ``id`` 的数字后缀（如 ``corpus_12`` -> 12）推断，保证老数据
+    也能得到与插入顺序一致的稳定全序。
+    """
+    seq = record.get("_seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        return seq
+    rid = record.get("id")
+    if rid:
+        try:
+            return int(str(rid).rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            pass
+    return 0
+
+
+def _order_key(record: dict, field: str) -> tuple:
+    """构造排序键：字段值（类型安全）+ 单调序号，构成确定性全序。
+
+    - 数字一组、字符串一组、缺失值（None）最后，避免异类型比较抛错；
+    - 末位 ``_seq`` 保证字段值相同时顺序依然确定，跨分片分页不重不漏。
+    """
+    value = record
+    for part in field.split("."):
+        if not isinstance(value, dict):
+            value = None
+            break
+        value = value.get(part)
+    seq = _seq_of(record)
+    if value is None:
+        return (2, 0.0, "", seq)
+    if isinstance(value, bool):
+        return (0, float(value), "", seq)
+    if isinstance(value, (int, float)):
+        return (0, float(value), "", seq)
+    return (1, 0.0, str(value), seq)
+
+
 class ShardedStore:
     """单个任务的 JSON 分片存储。"""
 
@@ -128,6 +169,7 @@ class ShardedStore:
         with FileLock(lock_path_for(self.meta_path)):
             meta = self._read_meta()
             record_id = record.get("id") or f"{self.task}_{meta['next_id']}"
+            record["_seq"] = meta["next_id"]
             meta["next_id"] = meta["next_id"] + 1
             record["id"] = record_id
             record.setdefault("_created", time.time())
@@ -162,6 +204,7 @@ class ShardedStore:
             for record in records:
                 record = dict(record)
                 rid = record.get("id") or f"{self.task}_{meta['next_id']}"
+                record["_seq"] = meta["next_id"]
                 meta["next_id"] += 1
                 record["id"] = rid
                 record.setdefault("_created", time.time())
@@ -211,23 +254,28 @@ class ShardedStore:
               order_by: Optional[str] = None,
               order: str = "asc",
               limit: Optional[int] = None,
-              offset: int = 0) -> list[dict]:
+              offset: int = 0,
+              include_deleted: bool = False) -> list[dict]:
         """跨分片查询并合并结果。
 
         ``where`` 形如 ``[("field", "op", value), ...]``，op 见 ``_OPERATORS``。
         过滤在扫描过程中进行，最终按 ``order_by`` 排序并分页。
+        排序键附带单调序号构成全序，保证字段值相同时分页依然不重不漏；
+        墓碑记录默认不参与查询。
         """
         conditions = where or []
         matched = []
         with FileLock(lock_path_for(self.meta_path), mode="shared"):
             for record in self._iter_all_locked():
+                if not include_deleted and record.get("_deleted"):
+                    continue
                 if self._matches(record, conditions):
                     matched.append(record)
 
         if order_by is not None:
             reverse = order == "desc"
             matched.sort(
-                key=lambda r: r.get(order_by, ""),
+                key=lambda r: _order_key(r, order_by),
                 reverse=reverse,
             )
         if offset:
@@ -254,6 +302,37 @@ class ShardedStore:
             except (TypeError, ValueError):
                 return False
         return True
+
+    # -- 更新（原位写回，保持位置与序号不变） ------------------------------
+    def update(self, record_id: str, patch: dict) -> Optional[dict]:
+        """按 id 原位更新记录（浅合并 patch），返回更新后的记录。
+
+        记录在分片中的位置、``id``、``_seq``、``_created`` 都保持不变，
+        因此改标签等字段不会影响其它记录的相对顺序；记录不存在或已删除
+        时返回 ``None``。
+        """
+        if not isinstance(patch, dict):
+            raise TypeError("patch 必须是 dict")
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") != record_id:
+                            continue
+                        if record.get("_deleted"):
+                            return None
+                        updated = dict(record)
+                        for key, value in patch.items():
+                            if key in ("id", "_seq", "_created"):
+                                continue
+                            updated[key] = value
+                        records[i] = updated
+                        self._write_shard(index, records)
+                        return updated
+        return None
 
     # -- 删除（墓碑） -----------------------------------------------------
     def delete(self, record_id: str) -> bool:

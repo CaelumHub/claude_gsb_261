@@ -12,57 +12,149 @@
 
   <main class="main">
     <h1 class="page-title">语料库管理</h1>
-    <p class="page-desc">上传、查看并清洗语料；语料以 JSON 分片文件存储，支持清洗去停用词。</p>
+    <p class="page-desc">批量入库、多标签、组合筛选与导出；语料以 JSON 分片存储，筛选排序跨分片汇总。</p>
 
     <div class="grid cols-2">
-      <!-- 上传 -->
+      <!-- 批量导入 -->
       <section class="card">
-        <h2>上传语料</h2>
+        <h2>批量导入</h2>
+        <div class="mb">
+          <label>选择多个文件（.txt / .md，支持 UTF-8 / GBK；单个文件失败不影响整批）</label>
+          <input type="file" id="batch-files" multiple accept=".txt,.md,.json,.csv">
+        </div>
+        <div class="mb">
+          <label>或粘贴 JSON 数组（[{"name": "...", "text": "...", "tags": ["..."]}, …]）</label>
+          <textarea id="batch-json" placeholder='[{"name":"文档1","text":"正文…","tags":["新闻"]}]'></textarea>
+        </div>
+        <div class="row">
+          <button class="btn" id="btn-batch-json">导入 JSON</button>
+          <span class="muted small" id="batch-summary"></span>
+        </div>
+        <div id="batch-errors" class="mt"></div>
+      </section>
+
+      <!-- 单篇添加 -->
+      <section class="card">
+        <h2>添加单篇</h2>
         <div class="mb">
           <label>语料名称</label>
           <input type="text" id="corpus-name" placeholder="例如：新闻语料（可选）">
         </div>
         <div class="mb">
+          <label>标签（逗号分隔，可多个）</label>
+          <input type="text" id="corpus-tags" placeholder="例如：新闻, 财经">
+        </div>
+        <div class="mb">
           <label>语料内容（粘贴文本）</label>
           <textarea id="corpus-text" placeholder="在此粘贴语料文本…"></textarea>
         </div>
-        <div class="row">
-          <button class="btn" id="btn-add">添加语料</button>
-          <span class="muted small">或</span>
-        </div>
-        <div class="mt">
-          <label>上传文件（.txt / .md / .json，支持 UTF-8 / GBK）</label>
-          <input type="file" id="corpus-file" accept=".txt,.md,.json,.csv">
-        </div>
-      </section>
-
-      <!-- 清洗 -->
-      <section class="card">
-        <h2>文本清洗</h2>
-        <div class="mb">
-          <label>选择语料</label>
-          <select id="clean-corpus"></select>
-        </div>
-        <div class="mb">
-          <label><input type="checkbox" id="remove-stopwords" checked> 去除停用词</label>
-        </div>
-        <button class="btn" id="btn-clean">执行清洗</button>
-        <div class="mt">
-          <h3>清洗结果</h3>
-          <div id="clean-result" class="muted small">尚未清洗。</div>
-        </div>
+        <button class="btn" id="btn-add">添加语料</button>
       </section>
     </div>
 
-    <!-- 语料列表 -->
+    <!-- 筛选与排序 -->
     <section class="card">
       <div class="toolbar">
-        <h2 style="margin:0;flex:1">语料列表</h2>
+        <h2 style="margin:0;flex:1">筛选与排序</h2>
+        <select id="saved-filters" style="width:auto">
+          <option value="">已保存的筛选…</option>
+        </select>
+        <button class="btn secondary small" id="btn-apply-filter">应用</button>
+        <button class="btn secondary small" id="btn-delete-filter">删除</button>
+        <button class="btn secondary small" id="btn-save-filter">保存当前条件</button>
+      </div>
+      <div class="filter-grid mb">
+        <div>
+          <label>关键词（名称与全文）</label>
+          <input type="text" id="f-keyword" placeholder="输入关键词…">
+        </div>
+        <div>
+          <label>长度 ≥</label>
+          <input type="number" id="f-min-len" min="0" placeholder="不限">
+        </div>
+        <div>
+          <label>长度 ≤</label>
+          <input type="number" id="f-max-len" min="0" placeholder="不限">
+        </div>
+        <div>
+          <label>创建时间从</label>
+          <input type="datetime-local" id="f-start">
+        </div>
+        <div>
+          <label>创建时间至</label>
+          <input type="datetime-local" id="f-end">
+        </div>
+        <div>
+          <label>排序</label>
+          <select id="f-sort">
+            <option value="created_at">按创建时间</option>
+            <option value="length">按长度</option>
+            <option value="name">按名称</option>
+          </select>
+        </div>
+        <div>
+          <label>方向</label>
+          <select id="f-order">
+            <option value="desc">降序</option>
+            <option value="asc">升序</option>
+          </select>
+        </div>
+        <div>
+          <label>每页条数</label>
+          <select id="f-page-size">
+            <option>10</option>
+            <option selected>20</option>
+            <option>50</option>
+            <option>100</option>
+          </select>
+        </div>
+      </div>
+      <div class="mb">
+        <label>标签筛选（点击切换，可多选）</label>
+        <div class="chips" id="tag-chips"><span class="muted small">加载中…</span></div>
+      </div>
+      <div class="row">
+        <div>
+          <label>标签匹配方式</label>
+          <select id="f-tag-mode" style="width:auto">
+            <option value="any">任一标签命中即可</option>
+            <option value="all">必须同时包含全部所选标签</option>
+          </select>
+        </div>
+        <button class="btn secondary" id="btn-reset">重置条件</button>
+      </div>
+    </section>
+
+    <!-- 结果列表 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">语料列表 <span class="badge blue" id="result-total">0</span></h2>
+        <select id="export-format" style="width:auto">
+          <option value="json">JSON</option>
+          <option value="txt">TXT</option>
+        </select>
+        <button class="btn secondary small" id="btn-export">导出筛选结果</button>
         <button class="btn secondary small" id="btn-refresh">刷新</button>
       </div>
       <div class="list" id="corpus-list">
         <div class="muted">加载中…</div>
       </div>
+      <div class="pagination" id="pagination"></div>
+      <div id="doc-view" class="mt" style="display:none"></div>
+    </section>
+
+    <!-- 清洗 -->
+    <section class="card">
+      <h2>文本清洗</h2>
+      <div class="row mb">
+        <div class="grow">
+          <label>选择语料</label>
+          <select id="clean-corpus"></select>
+        </div>
+        <label style="margin:0"><input type="checkbox" id="remove-stopwords" checked> 去除停用词</label>
+        <button class="btn" id="btn-clean">执行清洗</button>
+      </div>
+      <div id="clean-result" class="muted small">尚未清洗。</div>
     </section>
   </main>
 </div>
@@ -71,56 +163,195 @@
 <script>
 renderNav("corpus.html");
 
-let currentCorpora = [];
+/* ---------- 筛选状态（localStorage 记住上次条件） ---------- */
+const LS_KEY = "corpus.filter.v1";
+const state = {
+  keyword: "", tags: [], tag_mode: "any",
+  min_len: "", max_len: "", start: "", end: "",
+  sort: "created_at", order: "desc",
+  page: 1, page_size: 20,
+};
+let allTags = [];
 
-async function loadCorpora() {
-  const list = $("#corpus-list");
-  list.innerHTML = '<div class="muted">加载中…</div>';
+function localToTs(v) { return v ? new Date(v).getTime() / 1000 : null; }
+function tsToLocal(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/* 从界面控件读入 state（页码重置为 1） */
+function collectFilter() {
+  state.keyword = $("#f-keyword").value.trim();
+  state.tag_mode = $("#f-tag-mode").value;
+  state.min_len = $("#f-min-len").value;
+  state.max_len = $("#f-max-len").value;
+  state.start = $("#f-start").value;
+  state.end = $("#f-end").value;
+  state.sort = $("#f-sort").value;
+  state.order = $("#f-order").value;
+  state.page_size = parseInt($("#f-page-size").value, 10) || 20;
+  state.page = 1;
+  localStorage.setItem(LS_KEY, JSON.stringify({ ...state, page: 1 }));
+}
+
+/* 把一份筛选条件对象写回界面控件 */
+function applyFilter(f) {
+  $("#f-keyword").value = f.keyword || "";
+  $("#f-tag-mode").value = f.tag_mode || "any";
+  $("#f-min-len").value = f.min_len ?? "";
+  $("#f-max-len").value = f.max_len ?? "";
+  $("#f-start").value = typeof f.start === "number" ? tsToLocal(f.start) : (f.start || "");
+  $("#f-end").value = typeof f.end === "number" ? tsToLocal(f.end) : (f.end || "");
+  $("#f-sort").value = f.sort || "created_at";
+  $("#f-order").value = f.order || "desc";
+  $("#f-page-size").value = f.page_size || 20;
+  state.tags = Array.isArray(f.tags) ? f.tags.slice() : [];
+  renderTagChips();
+  collectFilter();
+}
+
+function queryParams() {
+  const p = new URLSearchParams();
+  if (state.keyword) p.set("keyword", state.keyword);
+  if (state.tags.length) { p.set("tags", state.tags.join(",")); p.set("tag_mode", state.tag_mode); }
+  if (state.min_len !== "") p.set("min_len", state.min_len);
+  if (state.max_len !== "") p.set("max_len", state.max_len);
+  const start = localToTs(state.start), end = localToTs(state.end);
+  if (start) p.set("start", start);
+  if (end) p.set("end", end);
+  p.set("sort", state.sort);
+  p.set("order", state.order);
+  p.set("page", state.page);
+  p.set("page_size", state.page_size);
+  return p;
+}
+
+/* ---------- 标签 chips ---------- */
+async function loadTags() {
   try {
-    const data = await api("/api/corpus");
-    currentCorpora = data.corpora;
-    if (!currentCorpora.length) {
-      list.innerHTML = '<div class="muted">暂无语料，请先上传。</div>';
+    const data = await api("/api/corpus/tags");
+    allTags = data.tags;
+    renderTagChips();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderTagChips() {
+  const host = $("#tag-chips");
+  if (!allTags.length) {
+    host.innerHTML = '<span class="muted small">暂无标签，可在添加语料或编辑时创建。</span>';
+    return;
+  }
+  host.innerHTML = allTags.map(t => {
+    const on = state.tags.includes(t.name) ? " active" : "";
+    return `<span class="chip${on}" data-tag="${esc(t.name)}">${esc(t.name)}<span class="cnt">${t.count}</span></span>`;
+  }).join("");
+  $$("#tag-chips .chip").forEach(el => el.addEventListener("click", () => {
+    const tag = el.dataset.tag;
+    const i = state.tags.indexOf(tag);
+    if (i >= 0) state.tags.splice(i, 1); else state.tags.push(tag);
+    el.classList.toggle("active");
+    collectFilter();
+    runQuery();
+  }));
+}
+
+/* ---------- 查询与渲染 ---------- */
+async function runQuery() {
+  const list = $("#corpus-list");
+  try {
+    const data = await api("/api/corpus/query?" + queryParams().toString());
+    state.page = data.page;
+    $("#result-total").textContent = data.total;
+    if (!data.items.length) {
+      list.innerHTML = '<div class="muted">没有符合条件的语料。</div>';
     } else {
-      list.innerHTML = currentCorpora.map(c => `
+      list.innerHTML = data.items.map(c => `
         <div class="list-item">
           <div class="meta">
             <div class="name">${esc(c.name)} <span class="badge blue small">${c.length} 字</span></div>
             <div class="sub">ID: ${esc(c.id)} · 创建于 ${fmtTime(c.created_at)}</div>
+            <div class="mt" id="tags-${esc(c.id)}">${renderTags(c)}</div>
             <div class="preview mt">${esc(c.preview)}</div>
           </div>
           <button class="btn secondary small" onclick="viewCorpus('${esc(c.id)}')">查看</button>
+          <button class="btn secondary small" onclick="tagEditor('${esc(c.id)}')">标签</button>
           <button class="btn danger small" onclick="delCorpus('${esc(c.id)}')">删除</button>
         </div>`).join("");
     }
-    // 同步清洗下拉框
+    renderPagination(data);
+    // 同步清洗下拉框（保持当前选择）
     const sel = $("#clean-corpus");
-    sel.innerHTML = currentCorpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    const keep = sel.value;
+    const all = await api("/api/corpus");
+    sel.innerHTML = all.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    if (keep) sel.value = keep;
   } catch (e) { toast(e.message, "err"); }
 }
 
-async function addCorpus() {
-  const text = $("#corpus-text").value.trim();
-  const name = $("#corpus-name").value.trim();
-  if (!text) return toast("请输入语料内容", "err");
-  const btn = $("#btn-add");
-  setLoading(btn, true, "添加中…");
+function renderTags(c) {
+  const tags = (c.tags || []).map(t => `<span class="tag-badge">${esc(t)}</span>`).join("");
+  return tags || '<span class="muted small">无标签</span>';
+}
+
+function renderPagination(data) {
+  const host = $("#pagination");
+  if (data.pages <= 1) { host.innerHTML = ""; return; }
+  const cur = data.page;
+  let pages = [];
+  const push = v => { if (!pages.includes(v) && v >= 1 && v <= data.pages) pages.push(v); };
+  push(1); push(cur - 1); push(cur); push(cur + 1); push(data.pages);
+  pages.sort((a, b) => a - b);
+  let html = `<button ${cur <= 1 ? "disabled" : ""} data-page="${cur - 1}">‹</button>`;
+  let last = 0;
+  for (const p of pages) {
+    if (p - last > 1) html += '<span class="muted small">…</span>';
+    html += `<button data-page="${p}" class="${p === cur ? "cur" : ""}">${p}</button>`;
+    last = p;
+  }
+  html += `<button ${cur >= data.pages ? "disabled" : ""} data-page="${cur + 1}">›</button>`;
+  html += `<span class="muted small">第 ${cur} / ${data.pages} 页 · 共 ${data.total} 篇</span>`;
+  host.innerHTML = html;
+  $$("#pagination button[data-page]").forEach(b => b.addEventListener("click", () => {
+    state.page = parseInt(b.dataset.page, 10);
+    runQuery();
+  }));
+}
+
+/* ---------- 标签编辑 ---------- */
+function tagEditor(id) {
+  const host = document.getElementById(`tags-${id}`);
+  const current = Array.from(host.querySelectorAll(".tag-badge")).map(b => b.textContent);
+  host.innerHTML = `
+    <span class="tag-edit">
+      <input type="text" id="tag-input-${esc(id)}" value="${esc(current.join(", "))}" placeholder="逗号分隔多个标签">
+      <button class="btn small" onclick="saveTags('${esc(id)}')">保存</button>
+      <button class="btn secondary small" onclick="runQuery()">取消</button>
+    </span>`;
+  const input = document.getElementById(`tag-input-${id}`);
+  input.focus();
+  input.addEventListener("keydown", ev => { if (ev.key === "Enter") saveTags(id); });
+}
+
+async function saveTags(id) {
+  const raw = document.getElementById(`tag-input-${id}`).value;
   try {
-    await api("/api/corpus", { method: "POST", body: { name, text } });
-    toast("语料已添加");
-    $("#corpus-text").value = "";
-    $("#corpus-name").value = "";
-    loadCorpora();
+    await api(`/api/corpus/${id}/tags`, { method: "PUT", body: { tags: raw } });
+    toast("标签已更新");
+    await loadTags();
+    runQuery();
   } catch (e) { toast(e.message, "err"); }
-  setLoading(btn, false);
 }
 
+/* ---------- 查看 / 删除 ---------- */
 async function viewCorpus(id) {
   try {
     const r = await api(`/api/corpus/${id}`);
-    $("#clean-result").innerHTML =
-      `<strong>全文（${r.text.length} 字）：</strong><div class="output">${esc(r.text)}</div>`;
-    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    const box = $("#doc-view");
+    box.style.display = "block";
+    box.innerHTML = `<h3>${esc(r.name)}（${r.text.length} 字）</h3><div class="output">${esc(r.text)}</div>`;
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -129,10 +360,155 @@ async function delCorpus(id) {
   try {
     await api(`/api/corpus/${id}`, { method: "DELETE" });
     toast("已删除");
-    loadCorpora();
+    await loadTags();
+    runQuery();
   } catch (e) { toast(e.message, "err"); }
 }
 
+/* ---------- 添加 / 批量导入 ---------- */
+async function addCorpus() {
+  const text = $("#corpus-text").value.trim();
+  if (!text) return toast("请输入语料内容", "err");
+  const btn = $("#btn-add");
+  setLoading(btn, true, "添加中…");
+  try {
+    await api("/api/corpus", {
+      method: "POST",
+      body: { name: $("#corpus-name").value.trim(), text, tags: $("#corpus-tags").value },
+    });
+    toast("语料已添加");
+    $("#corpus-text").value = "";
+    $("#corpus-name").value = "";
+    $("#corpus-tags").value = "";
+    await loadTags();
+    runQuery();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function showBatchResult(r) {
+  $("#batch-summary").textContent = `成功 ${r.imported} 篇，失败 ${r.failed} 篇`;
+  const box = $("#batch-errors");
+  if (r.errors && r.errors.length) {
+    box.innerHTML = r.errors.map(e =>
+      `<div class="badge red" style="margin:2px 4px 2px 0">${esc(e.name || ("第 " + (e.index + 1) + " 篇"))}：${esc(e.error)}</div>`
+    ).join("");
+  } else {
+    box.innerHTML = "";
+  }
+}
+
+$("#batch-files").addEventListener("change", async (ev) => {
+  const files = Array.from(ev.target.files);
+  if (!files.length) return;
+  const fd = new FormData();
+  files.forEach(f => fd.append("files", f));
+  try {
+    const r = await api("/api/corpus/upload_batch", { method: "POST", body: fd });
+    showBatchResult(r);
+    toast(`批量导入完成：成功 ${r.imported} 篇，失败 ${r.failed} 篇`, r.failed ? "err" : "ok");
+    await loadTags();
+    runQuery();
+  } catch (e) { toast(e.message, "err"); }
+  ev.target.value = "";
+});
+
+$("#btn-batch-json").addEventListener("click", async () => {
+  const raw = $("#batch-json").value.trim();
+  if (!raw) return toast("请粘贴 JSON 数组", "err");
+  let docs;
+  try { docs = JSON.parse(raw); } catch (_) { return toast("JSON 格式不正确", "err"); }
+  if (!Array.isArray(docs)) docs = [docs];
+  try {
+    const r = await api("/api/corpus/batch", { method: "POST", body: { documents: docs } });
+    showBatchResult(r);
+    toast(`批量导入完成：成功 ${r.imported} 篇，失败 ${r.failed} 篇`, r.failed ? "err" : "ok");
+    $("#batch-json").value = "";
+    await loadTags();
+    runQuery();
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------- 导出（与当前筛选一致） ---------- */
+$("#btn-export").addEventListener("click", async () => {
+  const format = $("#export-format").value;
+  const filter = {
+    keyword: state.keyword, tags: state.tags, tag_mode: state.tag_mode,
+    min_len: state.min_len === "" ? null : Number(state.min_len),
+    max_len: state.max_len === "" ? null : Number(state.max_len),
+    start: localToTs(state.start), end: localToTs(state.end),
+    sort: state.sort, order: state.order,
+  };
+  try {
+    const resp = await fetch("/api/corpus/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filter, format }),
+    });
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => null);
+      throw new Error((d && d.error) || `导出失败 (${resp.status})`);
+    }
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `corpus_export.${format === "txt" ? "txt" : "json"}`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`已导出 ${$("#result-total").textContent} 篇筛选结果`);
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------- 已保存的筛选条件 ---------- */
+async function loadSavedFilters() {
+  try {
+    const data = await api("/api/corpus/filters");
+    const sel = $("#saved-filters");
+    sel.innerHTML = '<option value="">已保存的筛选…</option>' +
+      data.filters.map(f => `<option value="${esc(f.id)}">${esc(f.name)}</option>`).join("");
+    sel._data = data.filters;
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#btn-save-filter").addEventListener("click", async () => {
+  const name = prompt("为当前筛选条件命名：");
+  if (!name) return;
+  collectFilter();
+  const filter = {
+    keyword: state.keyword, tags: state.tags, tag_mode: state.tag_mode,
+    min_len: state.min_len === "" ? null : Number(state.min_len),
+    max_len: state.max_len === "" ? null : Number(state.max_len),
+    start: localToTs(state.start), end: localToTs(state.end),
+    sort: state.sort, order: state.order, page_size: state.page_size,
+  };
+  try {
+    await api("/api/corpus/filters", { method: "POST", body: { name, filter } });
+    toast("筛选条件已保存");
+    loadSavedFilters();
+  } catch (e) { toast(e.message, "err"); }
+});
+
+$("#btn-apply-filter").addEventListener("click", () => {
+  const sel = $("#saved-filters");
+  const f = (sel._data || []).find(x => x.id === sel.value);
+  if (!f) return toast("请先选择一个已保存的筛选", "err");
+  applyFilter(f.filter || {});
+  toast(`已应用「${f.name}」`);
+  runQuery();
+});
+
+$("#btn-delete-filter").addEventListener("click", async () => {
+  const sel = $("#saved-filters");
+  if (!sel.value) return toast("请先选择一个已保存的筛选", "err");
+  if (!confirm("确认删除该筛选条件？")) return;
+  try {
+    await api(`/api/corpus/filters/${sel.value}`, { method: "DELETE" });
+    toast("已删除");
+    loadSavedFilters();
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------- 清洗 ---------- */
 async function cleanCorpus() {
   const id = $("#clean-corpus").value;
   if (!id) return toast("请先添加语料", "err");
@@ -151,25 +527,33 @@ async function cleanCorpus() {
   setLoading(btn, false);
 }
 
-// 文件上传
-$("#corpus-file").addEventListener("change", async (ev) => {
-  const file = ev.target.files[0];
-  if (!file) return;
-  const fd = new FormData();
-  fd.append("file", file);
-  try {
-    const r = await api("/api/corpus/upload", { method: "POST", body: fd });
-    toast(`已上传「${r.name}」(${r.length} 字)`);
-    loadCorpora();
-  } catch (e) { toast(e.message, "err"); }
-  ev.target.value = "";
+/* ---------- 事件绑定 ---------- */
+$("#btn-add").addEventListener("click", addCorpus);
+$("#btn-refresh").addEventListener("click", () => { loadTags(); runQuery(); });
+$("#btn-clean").addEventListener("click", cleanCorpus);
+$("#btn-reset").addEventListener("click", () => {
+  applyFilter({});
+  runQuery();
 });
 
-$("#btn-add").addEventListener("click", addCorpus);
-$("#btn-refresh").addEventListener("click", loadCorpora);
-$("#btn-clean").addEventListener("click", cleanCorpus);
+// 筛选控件变更即查询（关键词输入做防抖）
+let kwTimer = null;
+$("#f-keyword").addEventListener("input", () => {
+  clearTimeout(kwTimer);
+  kwTimer = setTimeout(() => { collectFilter(); runQuery(); }, 300);
+});
+["#f-min-len", "#f-max-len", "#f-start", "#f-end", "#f-sort", "#f-order", "#f-page-size", "#f-tag-mode"]
+  .forEach(sel => $(sel).addEventListener("change", () => { collectFilter(); runQuery(); }));
 
-loadCorpora();
+/* ---------- 初始化：恢复上次筛选条件 ---------- */
+(function init() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+    if (saved) applyFilter(saved); else renderTagChips();
+  } catch (_) { renderTagChips(); }
+  loadTags().then(runQuery);
+  loadSavedFilters();
+})();
 </script>
 </body>
 </html>

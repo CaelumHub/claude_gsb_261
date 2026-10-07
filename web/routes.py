@@ -11,6 +11,7 @@ import re
 import time
 import uuid
 from typing import Optional
+from urllib.parse import quote
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -20,6 +21,7 @@ from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
+from storage.sharded import _order_key
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -120,16 +122,165 @@ def meta():
 # 语料库管理
 # ---------------------------------------------------------------------------
 
+# 列表/筛选支持的排序字段
+_CORPUS_SORT_FIELDS = ("created_at", "length", "name")
+
+
+def _decode_text(raw: bytes) -> Optional[str]:
+    """尝试用常见编码解码文件内容，全部失败返回 None。"""
+    for enc in ("utf-8", "gbk", "gb18030", "utf-16"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
+def _normalize_tags(raw) -> list:
+    """把任意输入规范化为去重、去空的字符串标签列表。
+
+    兼容字符串（按逗号/分号/空白分隔）与数组两种形式。
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = re.split(r"[,，;；\s]+", raw)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    tags = []
+    for item in raw:
+        tag = str(item).strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _corpus_item(record: dict) -> dict:
+    """把存储记录规范化为语料条目（含全文，供筛选/导出内部使用）。"""
+    text = record.get("text", "")
+    return {
+        "id": record.get("id"),
+        "name": record.get("name", "未命名"),
+        "text": text,
+        "tags": _normalize_tags(record.get("tags")),
+        "length": record.get("length") or len(text),
+        "created_at": record.get("created_at"),
+        "_seq": record.get("_seq"),
+        "preview": text[:80],
+    }
+
+
+def _public_item(item: dict) -> dict:
+    """列表响应用的精简条目（不带全文与内部序号）。"""
+    return {k: v for k, v in item.items() if k not in ("text", "_seq")}
+
+
+def _validate_document(raw) -> tuple[Optional[dict], Optional[str]]:
+    """校验并规范化单篇待导入文档，返回 ``(record, error)``。"""
+    if not isinstance(raw, dict):
+        return None, "文档必须是 JSON 对象"
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, "缺少有效的 text 字段（非空字符串）"
+    text = text.strip()
+    name = raw.get("name")
+    if name is not None and not isinstance(name, str):
+        return None, "name 必须是字符串"
+    tags = raw.get("tags", [])
+    if tags and not isinstance(tags, (list, tuple, str)):
+        return None, "tags 必须是字符串或字符串数组"
+    created_at = raw.get("created_at")
+    if created_at is not None:
+        try:
+            created_at = float(created_at)
+        except (TypeError, ValueError):
+            return None, "created_at 必须是数字时间戳"
+    record = {
+        "name": (name or "").strip() or f"语料_{int(time.time())}",
+        "text": text,
+        "tags": _normalize_tags(tags),
+        "length": len(text),
+        "created_at": created_at or time.time(),
+    }
+    return record, None
+
+
+def _corpus_matches(item: dict, params: dict) -> bool:
+    """判断语料条目是否满足组合筛选条件。"""
+    keyword = (params.get("keyword") or "").strip().lower()
+    if keyword:
+        haystack = (item["name"] + "\n" + item["text"]).lower()
+        if keyword not in haystack:
+            return False
+    tags = params.get("tags") or []
+    if tags:
+        owned = set(item["tags"])
+        if params.get("tag_mode") == "all":
+            if not all(t in owned for t in tags):
+                return False
+        elif not any(t in owned for t in tags):
+            return False
+    min_len = params.get("min_len")
+    if min_len is not None and item["length"] < min_len:
+        return False
+    max_len = params.get("max_len")
+    if max_len is not None and item["length"] > max_len:
+        return False
+    start = params.get("start")
+    if start is not None and (item["created_at"] or 0) < start:
+        return False
+    end = params.get("end")
+    if end is not None and (item["created_at"] or 0) > end:
+        return False
+    return True
+
+
+def _filter_corpus(params: dict) -> list:
+    """跨全部语料分片汇总，按组合条件过滤并稳定排序。
+
+    列表分页与导出共用这一份逻辑，保证导出内容与页面看到的一致。
+    排序键由 :func:`_order_key` 提供（字段值 + 单调序号），构成确定性
+    全序：新增、删除、改标签后翻页顺序依然连续、不重不漏。
+    """
+    store = _registry().task("corpus")
+    items = [_corpus_item(r) for r in store.all() if not r.get("_deleted")]
+    matched = [it for it in items if _corpus_matches(it, params)]
+    sort = params.get("sort") if params.get("sort") in _CORPUS_SORT_FIELDS \
+        else "created_at"
+    matched.sort(key=lambda it: _order_key(it, sort),
+                 reverse=params.get("order") != "asc")
+    return matched
+
+
+def _query_params(args) -> dict:
+    """从查询字符串/JSON 体解析筛选参数。"""
+    def _num(key, cast):
+        val = args.get(key)
+        if val in (None, ""):
+            return None
+        try:
+            return cast(val)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "keyword": (args.get("keyword") or "").strip(),
+        "tags": _normalize_tags(args.get("tags") or ""),
+        "tag_mode": args.get("tag_mode") or "any",
+        "min_len": _num("min_len", int),
+        "max_len": _num("max_len", int),
+        "start": _num("start", float),
+        "end": _num("end", float),
+        "sort": args.get("sort") or "created_at",
+        "order": args.get("order") or "desc",
+    }
+
+
 @api.get("/corpus")
 def list_corpus():
     records = _registry().task("corpus").all()
-    items = [{
-        "id": r.get("id"),
-        "name": r.get("name", "未命名"),
-        "length": len(r.get("text", "")),
-        "created_at": r.get("created_at"),
-        "preview": r.get("text", "")[:80],
-    } for r in records if not r.get("_deleted")]
+    items = [_public_item(_corpus_item(r))
+             for r in records if not r.get("_deleted")]
     items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
     return jsonify({"corpora": items})
 
@@ -137,16 +288,36 @@ def list_corpus():
 @api.post("/corpus")
 def create_corpus():
     data = _payload()
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "语料内容不能为空"}), 400
-    record = {
-        "name": data.get("name") or f"语料_{int(time.time())}",
-        "text": text,
-        "created_at": time.time(),
-    }
+    record, error = _validate_document(data)
+    if error:
+        return jsonify({"error": error}), 400
     rid = _registry().task("corpus").insert(record)
     return jsonify({"id": rid, "ok": True})
+
+
+@api.post("/corpus/batch")
+def batch_create_corpus():
+    """批量入库：逐篇校验，格式有问题的单篇进入 errors，不阻塞整批。"""
+    data = _payload()
+    docs = data.get("documents")
+    if not isinstance(docs, list) or not docs:
+        return jsonify({"error": "documents 必须是非空数组"}), 400
+    records, errors = [], []
+    for i, raw in enumerate(docs):
+        record, error = _validate_document(raw)
+        if error:
+            name = raw.get("name") if isinstance(raw, dict) else None
+            errors.append({"index": i, "name": name, "error": error})
+        else:
+            records.append(record)
+    ids = _registry().task("corpus").insert_many(records) if records else []
+    return jsonify({
+        "ok": True,
+        "imported": len(ids),
+        "failed": len(errors),
+        "ids": ids,
+        "errors": errors,
+    })
 
 
 @api.post("/corpus/upload")
@@ -154,26 +325,180 @@ def upload_corpus():
     file = request.files.get("file")
     if not file:
         return jsonify({"error": "未接收到文件"}), 400
-    raw = file.read()
-    text = None
-    for enc in ("utf-8", "gbk", "gb18030", "utf-16"):
-        try:
-            text = raw.decode(enc)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
+    text = _decode_text(file.read())
     if text is None:
         return jsonify({"error": "无法解码文件内容"}), 400
-    name = data_name = file.filename or "上传文件"
-    record = {"name": name, "text": text.strip(), "created_at": time.time()}
+    name = file.filename or "上传文件"
+    record = {"name": name, "text": text.strip(), "created_at": time.time(),
+              "length": len(text.strip()), "tags": []}
     rid = _registry().task("corpus").insert(record)
     return jsonify({"id": rid, "name": name, "length": len(text), "ok": True})
+
+
+@api.post("/corpus/upload_batch")
+def upload_batch_corpus():
+    """多文件批量上传：单个文件解码/校验失败只记入 errors，不影响其它文件。"""
+    files = request.files.getlist("files")
+    if not files and request.files.get("file"):
+        files = [request.files["file"]]
+    if not files:
+        return jsonify({"error": "未接收到文件"}), 400
+    records, errors = [], []
+    for f in files:
+        name = f.filename or "上传文件"
+        try:
+            raw = f.read()
+        except OSError:
+            errors.append({"name": name, "error": "读取文件失败"})
+            continue
+        text = _decode_text(raw)
+        if text is None:
+            errors.append({"name": name,
+                           "error": "无法解码（支持 UTF-8/GBK/GB18030/UTF-16）"})
+            continue
+        record, error = _validate_document({"name": name, "text": text})
+        if error:
+            errors.append({"name": name, "error": error})
+        else:
+            records.append(record)
+    ids = _registry().task("corpus").insert_many(records) if records else []
+    return jsonify({
+        "ok": True,
+        "imported": len(ids),
+        "failed": len(errors),
+        "ids": ids,
+        "errors": errors,
+    })
+
+
+@api.get("/corpus/query")
+def query_corpus():
+    """组合筛选 + 排序 + 分页：跨全部分片汇总，翻页连续不重不漏。"""
+    params = _query_params(request.args)
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = request.args.get("page_size", 20, type=int)
+    page_size = min(max(1, page_size), 200)
+
+    matched = _filter_corpus(params)
+    total = len(matched)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, pages)
+    items = matched[(page - 1) * page_size: page * page_size]
+    return jsonify({
+        "items": [_public_item(it) for it in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    })
+
+
+@api.get("/corpus/tags")
+def corpus_tags():
+    """全部标签及文档数（跨分片汇总，供筛选器勾选用）。"""
+    counts = {}
+    for r in _registry().task("corpus").all():
+        if r.get("_deleted"):
+            continue
+        for tag in _normalize_tags(r.get("tags")):
+            counts[tag] = counts.get(tag, 0) + 1
+    tags = [{"name": k, "count": v} for k, v in
+            sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return jsonify({"tags": tags})
+
+
+@api.put("/corpus/<cid>/tags")
+def update_corpus_tags(cid: str):
+    """原位更新一篇文档的标签，不影响其它文档及其顺序。"""
+    data = _payload()
+    tags = _normalize_tags(data.get("tags"))
+    updated = _registry().task("corpus").update(cid, {"tags": tags})
+    if updated is None:
+        return jsonify({"error": "语料不存在"}), 404
+    return jsonify({"ok": True, "id": cid, "tags": tags})
+
+
+@api.post("/corpus/export")
+def export_corpus():
+    """按当前筛选条件导出全部匹配文档（不分页），顺序与页面列表一致。"""
+    data = _payload()
+    params = _query_params(data.get("filter") or data)
+    fmt = (data.get("format") or "json").lower()
+    matched = _filter_corpus(params)
+    exported_at = time.time()
+
+    if fmt == "txt":
+        blocks = []
+        for it in matched:
+            header = [
+                f"===== {it['name']} ({it['id']}) =====",
+                f"标签: {', '.join(it['tags']) if it['tags'] else '无'}",
+                f"长度: {it['length']} 字",
+                "时间: " + time.strftime("%Y-%m-%d %H:%M:%S",
+                                         time.localtime(it['created_at'] or 0)),
+            ]
+            blocks.append("\n".join(header) + "\n\n" + it["text"])
+        body = "\n\n".join(blocks)
+        resp = current_app.response_class(body, mimetype="text/plain; charset=utf-8")
+        filename = "corpus_export.txt"
+    else:
+        payload = {
+            "exported_at": exported_at,
+            "count": len(matched),
+            "filter": params,
+            "documents": [{
+                "id": it["id"],
+                "name": it["name"],
+                "tags": it["tags"],
+                "length": it["length"],
+                "created_at": it["created_at"],
+                "text": it["text"],
+            } for it in matched],
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        resp = current_app.response_class(body, mimetype="application/json; charset=utf-8")
+        filename = "corpus_export.json"
+    resp.headers["Content-Disposition"] = \
+        f"attachment; filename*=UTF-8''{quote(filename)}"
+    return resp
+
+
+# -- 筛选条件保存（持久化，重启后仍可应用） ---------------------------------
+
+@api.get("/corpus/filters")
+def list_saved_filters():
+    records = _registry().task("saved_filter").all()
+    items = [{"id": r["id"], "name": r.get("name"), "filter": r.get("filter"),
+              "created_at": r.get("created_at")}
+             for r in records if not r.get("_deleted")]
+    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return jsonify({"filters": items})
+
+
+@api.post("/corpus/filters")
+def create_saved_filter():
+    data = _payload()
+    name = (data.get("name") or "").strip()
+    filt = data.get("filter")
+    if not name:
+        return jsonify({"error": "筛选条件名称不能为空"}), 400
+    if not isinstance(filt, dict):
+        return jsonify({"error": "filter 必须是对象"}), 400
+    record = {"name": name, "filter": filt, "created_at": time.time()}
+    rid = _registry().task("saved_filter").insert(record)
+    return jsonify({"id": rid, "ok": True})
+
+
+@api.delete("/corpus/filters/<fid>")
+def delete_saved_filter(fid: str):
+    ok = _registry().task("saved_filter").delete(fid)
+    return jsonify({"ok": ok})
 
 
 @api.get("/corpus/<cid>")
 def get_corpus(cid: str):
     record = _registry().task("corpus").get(cid)
-    if not record:
+    if not record or record.get("_deleted"):
         return jsonify({"error": "语料不存在"}), 404
     return jsonify(record)
 
