@@ -44,7 +44,7 @@ renderNav("segment.html");
 // 加载语料到下拉框
 async function loadCorpusOptions() {
   try {
-    const data = await api("/api/corpus");
+    const data = await api("/api/corpus/options");
     const sel = $("#corpus-sel");
     sel.innerHTML = '<option value="">— 从语料库选择 —</option>' +
       data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");

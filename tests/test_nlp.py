@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
 import tempfile
@@ -23,6 +25,12 @@ from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
 from nlp.hmm import HMM
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
+from storage.corpus_service import query as query_corpus
+
+try:
+    from app import create_app
+except ImportError:  # Flask 未安装时，纯存储/NLP 测试仍可运行
+    create_app = None
 
 
 class TestSegmenter(unittest.TestCase):
@@ -207,6 +215,155 @@ class TestStorage(unittest.TestCase):
         # 造一个非存储目录，不应被识别为任务
         os.makedirs(os.path.join(self.tmp, "models"))
         self.assertEqual(reg.tasks(), ["a", "b"])
+
+    def test_update_and_live_records(self):
+        store = ShardedStore(self.tmp, "t", shard_size=10)
+        rid = store.insert({"name": "a", "tags": []})
+        updated = store.update(rid, {"tags": ["x", "y"], "name": "b"})
+        self.assertEqual(updated["tags"], ["x", "y"])
+        self.assertEqual(updated["name"], "b")
+        store.delete(rid)
+        self.assertIsNone(store.get(rid))
+        self.assertEqual(store.all(), [])
+
+
+class TestCorpusService(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = ShardedStore(self.tmp, "corpus", shard_size=3)
+        base = 1_700_000_000
+        records = [
+            {"name": "新闻甲", "text": "机器学习推动人工智能发展", "tags": ["新闻", "AI"],
+             "created_at": base + 10},
+            {"name": "评论乙", "text": "产品很好用，服务优秀", "tags": ["评论"],
+             "created_at": base + 20},
+            {"name": "论文丙", "text": "深度学习是人工智能的重要分支", "tags": ["论文", "AI"],
+             "created_at": base + 30},
+            {"name": "短消息", "text": "你好", "tags": ["消息"],
+             "created_at": base + 40},
+        ]
+        self.ids = self.store.insert_many(records)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _params(self, **kwargs):
+        args = {
+            "tags": [], "tag_mode": "any", "keyword": "",
+            "length_min": None, "length_max": None,
+            "created_from": None, "created_to": None,
+            "sort": "created_at", "order": "desc",
+            "page_size": 2, "cursor": None, "direction": "next",
+        }
+        args.update(kwargs)
+        return args
+
+    def test_combined_filters(self):
+        params = self._params(keyword="人工智能", tags=["AI"], tag_mode="all")
+        result = query_corpus(self.store, params)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["records"][0]["id"], self.ids[2])
+
+    def test_stable_cursor_pagination_no_duplicate_or_gap(self):
+        expected_asc = self.ids
+        expected_desc = list(reversed(self.ids))
+        for order, expected in (("asc", expected_asc), ("desc", expected_desc)):
+            params = self._params(sort="created_at", order=order, page_size=2)
+            first = query_corpus(self.store, params)
+            self.assertEqual([r["id"] for r in first["records"]], expected[:2])
+            params["cursor"] = first["next_cursor"]
+            second = query_corpus(self.store, params)
+            self.assertEqual([r["id"] for r in second["records"]], expected[2:])
+            params["cursor"] = second["prev_cursor"]
+            params["direction"] = "prev"
+            back = query_corpus(self.store, params)
+            self.assertEqual([r["id"] for r in back["records"]], expected[:2])
+
+            params["direction"] = "next"
+            params["cursor"] = first["next_cursor"]
+            seen = [r["id"] for r in first["records"]]
+            page = first
+            while page["next_cursor"]:
+                params["cursor"] = page["next_cursor"]
+                page = query_corpus(self.store, params)
+                seen.extend(r["id"] for r in page["records"])
+            self.assertEqual(sorted(seen), sorted(self.ids))
+
+    def test_saved_filters_include_new_document(self):
+        params = self._params(keyword="人工智能", tags=["AI"], tag_mode="all")
+        before = query_corpus(self.store, params)
+        self.assertEqual(before["total"], 2)
+        self.store.insert({
+            "name": "新文档", "text": "人工智能持续发展", "tags": ["AI"],
+            "created_at": 1_700_000_100,
+        })
+        after = query_corpus(self.store, params)
+        self.assertEqual(after["total"], 3)
+
+    def test_delete_does_not_change_relative_order(self):
+        params = self._params(sort="created_at", order="asc", page_size=10)
+        before = [r["id"] for r in query_corpus(self.store, params)["records"]]
+        self.store.delete(self.ids[1])
+        after = [r["id"] for r in query_corpus(self.store, params)["records"]]
+        expected = [i for i in before if i != self.ids[1]]
+        self.assertEqual(after, expected)
+
+    def test_export_uses_same_global_order_as_page(self):
+        params = self._params(sort="created_at", order="desc", page_size=2)
+        page = query_corpus(self.store, params)
+        exported = query_corpus(self.store, params, full=True, page=False)
+        self.assertEqual([r["id"] for r in exported["records"][:2]],
+                         [r["id"] for r in page["records"]])
+        self.assertEqual(exported["total"], 4)
+
+
+class TestCorpusAPI(unittest.TestCase):
+    def setUp(self):
+        if create_app is None:
+            self.skipTest("Flask 未安装")
+        self.tmp = tempfile.mkdtemp()
+        self.app = create_app(self.tmp)
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_batch_upload_partial_failure_and_tags(self):
+        payload = (
+            '{"name":"good","text":"第一篇文档","tags":["新闻"]}\n'
+            '{"broken":\n'
+            '{"name":"empty","text":""}\n'
+        ).encode("utf-8")
+        resp = self.client.post(
+            "/api/corpus/upload",
+            data={"file": (io.BytesIO(payload), "docs.jsonl"), "tags": "AI"},
+            content_type="multipart/form-data")
+        data = resp.get_json()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(data["inserted_count"], 1)
+        self.assertEqual(data["failed_count"], 2)
+        self.assertEqual(data["inserted"][0]["tags"], ["AI", "新闻"])
+
+    def test_filter_export_matches_page(self):
+        for i in range(5):
+            resp = self.client.post("/api/corpus", json={
+                "name": f"新闻{i}", "text": f"关键词内容 {i}", "tags": ["新闻"]
+            })
+            self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/api/corpus?tags=" + "%E6%96%B0%E9%97%BB"
+                               + "&q=" + "%E5%85%B3%E9%94%AE%E8%AF%8D"
+                               + "&page_size=2")
+        page = resp.get_json()
+        self.assertEqual(page["total"], 5)
+        self.assertEqual(len(page["records"]), 2)
+        export = self.client.get(
+            "/api/corpus/export?tags=" + "%E6%96%B0%E9%97%BB"
+            + "&q=" + "%E5%85%B3%E9%94%AE%E8%AF%8D"
+            + "&scope=all&format=jsonl")
+        lines = [line for line in export.data.decode("utf-8").splitlines() if line]
+        self.assertEqual(len(lines), 5)
+        ids = [json.loads(line)["id"] for line in lines]
+        self.assertIn(page["records"][0]["id"], ids)
 
 
 class TestPipeline(unittest.TestCase):

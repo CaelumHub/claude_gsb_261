@@ -189,14 +189,15 @@ class ShardedStore:
         return ids
 
     # -- 查询 -------------------------------------------------------------
-    def _iter_all_locked(self) -> Iterator[dict]:
+    def _iter_all_locked(self, include_deleted: bool = False) -> Iterator[dict]:
         meta = self._read_meta()
         for index in range(meta.get("shard_count", 0)):
             for record in self._read_shard(index):
-                yield record
+                if include_deleted or not record.get("_deleted"):
+                    yield record
 
     def all(self) -> list[dict]:
-        """返回所有记录（按分片顺序）。"""
+        """返回所有存活记录（按分片顺序）。"""
         with FileLock(lock_path_for(self.meta_path), mode="shared"):
             return list(self._iter_all_locked())
 
@@ -205,6 +206,28 @@ class ShardedStore:
             for record in self._iter_all_locked():
                 if record.get("id") == record_id:
                     return record
+        return None
+
+    def update(self, record_id: str, changes: dict) -> Optional[dict]:
+        """在排他锁内读取-修改-写回单条记录，返回更新后的记录。"""
+        if not isinstance(changes, dict):
+            raise TypeError("changes 必须是 dict")
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for current, record in enumerate(records):
+                        if record.get("id") == record_id and not record.get("_deleted"):
+                            updated = dict(record)
+                            for key, value in changes.items():
+                                if key in ("id", "_deleted"):
+                                    continue
+                                updated[key] = value
+                            records[current] = updated
+                            self._write_shard(index, records)
+                            return updated
         return None
 
     def query(self, where: Optional[list] = None,
@@ -226,10 +249,15 @@ class ShardedStore:
 
         if order_by is not None:
             reverse = order == "desc"
-            matched.sort(
-                key=lambda r: r.get(order_by, ""),
-                reverse=reverse,
-            )
+            # 通用存储可能包含异构历史数据；仅在字段类型一致时追加 id 作为稳定次序。
+            field_types = {type(r.get(order_by, "")) for r in matched}
+            if len(field_types) == 1:
+                matched.sort(
+                    key=lambda r: (r.get(order_by, ""), str(r.get("id", ""))),
+                    reverse=reverse,
+                )
+            else:
+                matched.sort(key=lambda r: r.get(order_by, ""), reverse=reverse)
         if offset:
             matched = matched[offset:]
         if limit is not None:

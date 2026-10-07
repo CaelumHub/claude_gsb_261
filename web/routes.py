@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import time
 import uuid
 from typing import Optional
+from urllib.parse import quote
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
@@ -20,6 +23,16 @@ from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
+from storage.corpus_service import (
+    _doc_from_mapping,
+    build_params,
+    normalize_tags,
+    parse_documents,
+    prepare_document,
+    query as query_corpus,
+    serialize,
+    tag_facets,
+)
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -120,62 +133,241 @@ def meta():
 # 语料库管理
 # ---------------------------------------------------------------------------
 
+def _list_corpus_legacy():
+    records = _registry().task("corpus").all()
+    items = [serialize(r) for r in records]
+    items.sort(key=lambda x: (x.get("created_at", 0), x.get("id", "")), reverse=True)
+    return jsonify({"corpora": items})
+
+
 @api.get("/corpus")
 def list_corpus():
-    records = _registry().task("corpus").all()
-    items = [{
-        "id": r.get("id"),
-        "name": r.get("name", "未命名"),
-        "length": len(r.get("text", "")),
-        "created_at": r.get("created_at"),
-        "preview": r.get("text", "")[:80],
-    } for r in records if not r.get("_deleted")]
-    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    # 兼容旧页面：不带任何查询参数时返回原有结构
+    if not request.args:
+        return _list_corpus_legacy()
+    try:
+        params = build_params(request.args)
+        result = query_corpus(_registry().task("corpus"), params)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    result.update({
+        "filters": {
+            "tags": params["tags"], "tag_mode": params["tag_mode"],
+            "keyword": params["keyword"], "length_min": params["length_min"],
+            "length_max": params["length_max"], "created_from": params["created_from"],
+            "created_to": params["created_to"],
+        },
+        "facets": tag_facets(_registry().task("corpus"), params),
+    })
+    return jsonify(result)
+
+
+@api.get("/corpus/options")
+def corpus_options():
+    items = [{"id": r.get("id"), "name": r.get("name", "未命名")}
+             for r in _registry().task("corpus").all()]
+    items.sort(key=lambda x: x.get("name", ""))
     return jsonify({"corpora": items})
 
 
 @api.post("/corpus")
 def create_corpus():
     data = _payload()
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "语料内容不能为空"}), 400
-    record = {
-        "name": data.get("name") or f"语料_{int(time.time())}",
-        "text": text,
-        "created_at": time.time(),
-    }
+    try:
+        default_tags = normalize_tags(data.get("tags"))
+        record = prepare_document(data, default_tags=default_tags)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     rid = _registry().task("corpus").insert(record)
     return jsonify({"id": rid, "ok": True})
 
 
 @api.post("/corpus/upload")
 def upload_corpus():
-    file = request.files.get("file")
-    if not file:
+    files = request.files.getlist("file")
+    if not files:
         return jsonify({"error": "未接收到文件"}), 400
-    raw = file.read()
-    text = None
-    for enc in ("utf-8", "gbk", "gb18030", "utf-16"):
+    try:
+        default_tags = normalize_tags(request.form.getlist("tags"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    inserted = []
+    errors = []
+    store = _registry().task("corpus")
+    for file in files:
+        raw = file.read()
+        filename = file.filename or "上传文件"
         try:
-            text = raw.decode(enc)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
-    if text is None:
-        return jsonify({"error": "无法解码文件内容"}), 400
-    name = data_name = file.filename or "上传文件"
-    record = {"name": name, "text": text.strip(), "created_at": time.time()}
-    rid = _registry().task("corpus").insert(record)
-    return jsonify({"id": rid, "name": name, "length": len(text), "ok": True})
+            documents, parse_errors = parse_documents(filename, raw)
+        except ValueError as exc:
+            documents, parse_errors = [], [{"name": filename, "error": str(exc)}]
+        errors.extend(parse_errors)
+
+        for doc in documents:
+            try:
+                record = prepare_document(
+                    {"name": doc["name"], "text": doc["text"], "tags": doc["tags"]},
+                    default_tags=default_tags,
+                    fallback_name=filename)
+                inserted.append({"id": store.insert(record), "name": record["name"],
+                                 "length": len(record["text"]), "tags": record["tags"]})
+            except (TypeError, ValueError, OSError) as exc:
+                errors.append({"name": doc.get("name", filename), "error": str(exc)})
+    return jsonify({
+        "ok": bool(inserted),
+        "inserted_count": len(inserted),
+        "failed_count": len(errors),
+        "inserted": inserted,
+        "errors": errors,
+    }), (200 if inserted else 400)
+
+
+@api.post("/corpus/batch")
+def batch_create_corpus():
+    data = _payload()
+    files = data.get("files")
+    documents = data.get("documents")
+    if not files and not documents:
+        return jsonify({"error": "没有需要入库的文档"}), 400
+
+    try:
+        default_tags = normalize_tags(data.get("tags"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    parsed_docs = []
+    errors = []
+    if files:
+        if not isinstance(files, list):
+            return jsonify({"error": "files 必须是数组"}), 400
+        for item in files:
+            if not isinstance(item, dict) or "filename" not in item or "content" not in item:
+                errors.append({"name": "请求项", "error": "文件项必须包含 filename 和 content"})
+                continue
+            try:
+                raw = item["content"].encode("utf-8")
+            except AttributeError:
+                errors.append({"name": item.get("filename", "未知文件"), "error": "文件内容必须是字符串"})
+                continue
+            docs, file_errors = parse_documents(item["filename"], raw)
+            parsed_docs.extend(docs)
+            errors.extend(file_errors)
+    if documents:
+        if not isinstance(documents, list):
+            return jsonify({"error": "documents 必须是数组"}), 400
+        for index, item in enumerate(documents, 1):
+            if not isinstance(item, dict):
+                errors.append({"name": f"文档_{index}", "error": "文档必须是对象"})
+                continue
+            try:
+                parsed_docs.append(_doc_from_mapping(item, f"文档_{index}"))
+            except ValueError as exc:
+                errors.append({"name": item.get("name", f"文档_{index}"), "error": str(exc)})
+
+    inserted = []
+    store = _registry().task("corpus")
+    for doc in parsed_docs:
+        try:
+            record = prepare_document(doc, default_tags=default_tags)
+            inserted.append({"id": store.insert(record), "name": record["name"],
+                             "length": len(record["text"]), "tags": record.get("tags", [])})
+        except (TypeError, ValueError, OSError) as exc:
+            errors.append({"name": doc.get("name", "未知文档"), "error": str(exc)})
+
+    return jsonify({
+        "ok": bool(inserted),
+        "inserted_count": len(inserted),
+        "failed_count": len(errors),
+        "inserted": inserted,
+        "errors": errors,
+    }), (200 if inserted else 400)
+
+
+@api.get("/corpus/tags")
+def corpus_tags():
+    try:
+        params = build_params(request.args)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"tags": tag_facets(_registry().task("corpus"), params)})
+
+
+@api.get("/corpus/export")
+def export_corpus():
+    try:
+        params = build_params(request.args)
+        fmt = (request.args.get("format") or "jsonl").lower()
+        if fmt not in {"jsonl", "json", "csv", "txt"}:
+            raise ValueError("导出格式只能是 jsonl、json、csv 或 txt")
+        scope = (request.args.get("scope") or "all").lower()
+        if scope not in {"all", "page"}:
+            raise ValueError("导出范围只能是 all 或 page")
+        result = query_corpus(_registry().task("corpus"), params, full=True,
+                              page=(scope == "page"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    items = result["records"]
+
+    if fmt == "jsonl":
+        body = "\n".join(json.dumps(item, ensure_ascii=False) for item in items)
+        mimetype = "application/x-ndjson; charset=utf-8"
+        suffix = "jsonl"
+    elif fmt == "json":
+        body = json.dumps({"total": len(items), "documents": items},
+                          ensure_ascii=False, indent=2)
+        mimetype = "application/json; charset=utf-8"
+        suffix = "json"
+    elif fmt == "csv":
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=["id", "name", "tags", "length",
+                                                    "created_at", "text"])
+        writer.writeheader()
+        for item in items:
+            row = dict(item)
+            row["tags"] = ";".join(row.get("tags", []))
+            writer.writerow(row)
+        body = "﻿" + buffer.getvalue()
+        mimetype = "text/csv; charset=utf-8"
+        suffix = "csv"
+    else:
+        parts = []
+        for item in items:
+            parts.append(f"# {item['name']}\n# ID: {item['id']}\n"
+                         f"# 标签: {';'.join(item.get('tags', []))}\n"
+                         f"# 字数: {item['length']}\n\n{item['text']}\n")
+        separator = "\n\n" + ("=" * 60) + "\n\n"
+        body = separator.join(parts)
+        mimetype = "text/plain; charset=utf-8"
+        suffix = "txt"
+
+    filename = f"corpus_export_{time.strftime('%Y%m%d_%H%M%S')}.{suffix}"
+    response = Response(body, mimetype=mimetype)
+    response.headers["Content-Disposition"] = (
+        f"attachment; filename={filename}; filename*=UTF-8''{quote(filename)}")
+    response.headers["X-Total-Count"] = str(len(items))
+    return response
 
 
 @api.get("/corpus/<cid>")
 def get_corpus(cid: str):
     record = _registry().task("corpus").get(cid)
-    if not record:
+    if not record or record.get("_deleted"):
         return jsonify({"error": "语料不存在"}), 404
     return jsonify(record)
+
+
+@api.put("/corpus/<cid>/tags")
+def update_corpus_tags(cid: str):
+    data = _payload()
+    try:
+        tags = normalize_tags(data.get("tags"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    record = _registry().task("corpus").update(cid, {"tags": tags})
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    return jsonify({"ok": True, "id": cid, "tags": tags})
 
 
 @api.delete("/corpus/<cid>")
@@ -187,7 +379,7 @@ def delete_corpus(cid: str):
 @api.post("/corpus/<cid>/clean")
 def clean_corpus(cid: str):
     record = _registry().task("corpus").get(cid)
-    if not record:
+    if not record or record.get("_deleted"):
         return jsonify({"error": "语料不存在"}), 404
     data = _payload()
     result = _clean(record.get("text", ""), data.get("remove_stopwords", True))
